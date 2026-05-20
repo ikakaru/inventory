@@ -38,7 +38,7 @@ INITIAL_MANAGER_PASSWORD = os.environ.get("INVENTORY_PORTAL_MANAGER_PASSWORD", "
 LEGACY_DEFAULT_MANAGER_PASSWORD = "ChangeMe123!"
 PAGE_SIZE = 20
 AUDIT_PAGE_SIZE = 40
-MAX_ATTACHMENT_SIZE = 15 * 1024 * 1024
+MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024
 MANAGER_SETUP_PATH = DATA_DIR / "manager_setup.txt"
 MEDIA_ROUTES = {
     "round-logo": MEDIA_DIR / "round logo.png",
@@ -1155,7 +1155,7 @@ def render_item_form(user, csrf_token, values, errors, mode, item_id=None, exist
         '<div class="span-2 attachment-field">'
         '<span class="field-label">Attach File</span>'
         '<input id="attachment-upload" type="file" name="attachment">'
-        '<p class="muted small attachment-meta">Optional. Upload the supporting file the validator needs to review. Maximum size: 15 MB.</p>'
+        '<p class="muted small attachment-meta">Optional. Upload the supporting file the validator needs to review. Maximum size: 50 MB.</p>'
         f"{attachment_markup}"
         f"{attachment_reset_note}"
         "</div>"
@@ -2968,4 +2968,5 @@ def run():
 
 if __name__ == "__main__":
     run()
+
 
