@@ -709,6 +709,21 @@ body {
   border-bottom: none;
 }
 
+.dashboard-insight .metric-row-grade {
+  grid-template-columns: minmax(112px, 132px) 1fr 36px;
+}
+
+.dashboard-insight .metric-row-grade .metric-label {
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.dashboard-insight .metric-row-grade .metric-value {
+  text-align: right;
+  font-weight: 700;
+  color: #24502e;
+}
+
 .entry-page,
 .inventory-page {
   display: grid;
@@ -1089,6 +1104,52 @@ tbody tr:hover {
   border-top: 1px solid rgba(171, 135, 72, 0.16);
 }
 
+.attachment-field {
+  gap: 10px;
+}
+
+.field-label {
+  font-size: 0.93rem;
+  font-weight: 700;
+}
+
+.attachment-current {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(113, 131, 166, 0.16);
+  background: rgba(248, 250, 252, 0.88);
+}
+
+.attachment-label {
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.attachment-meta {
+  margin: 0;
+}
+
+.attachment-remove {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.attachment-remove input {
+  width: auto;
+}
+
+.attachment-remove label {
+  display: inline-flex;
+  gap: 0;
+  margin: 0;
+}
+
 .inventory-table-shell {
   background: rgba(255, 255, 255, 0.88);
   border-radius: 18px;
@@ -1304,6 +1365,18 @@ textarea:focus {
 .review-panel {
   margin-top: 18px;
   padding: 18px;
+}
+
+.attachment-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.attachment-copy {
+  margin-bottom: 0;
 }
 
 .detail-remarks {

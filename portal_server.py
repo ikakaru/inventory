@@ -10,13 +10,17 @@ import secrets
 import sqlite3
 import socket
 from datetime import datetime, timedelta
+from email.parser import BytesParser
+from email.policy import default as default_email_policy
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 
-APP_TITLE = "Inventory"
+APP_TITLE = "LRMDS Inventory"
+PORTAL_NAME = "Learning Resources Management and Development System"
+MANAGER_DISPLAY_NAME = "LRMDS Manager"
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DATA_DIR = BASE_DIR / "portal_data"
@@ -34,10 +38,11 @@ INITIAL_MANAGER_PASSWORD = os.environ.get("INVENTORY_PORTAL_MANAGER_PASSWORD", "
 LEGACY_DEFAULT_MANAGER_PASSWORD = "ChangeMe123!"
 PAGE_SIZE = 20
 AUDIT_PAGE_SIZE = 40
+MAX_ATTACHMENT_SIZE = 15 * 1024 * 1024
 MANAGER_SETUP_PATH = DATA_DIR / "manager_setup.txt"
 MEDIA_ROUTES = {
-    "round-logo": MEDIA_DIR / "cabadabaran logo.png",
-    "division-logo": MEDIA_DIR / "cabadabaran logo.png",
+    "round-logo": MEDIA_DIR / "round logo.png",
+    "division-logo": MEDIA_DIR / "round logo.png",
     "deped-wordmark": MEDIA_DIR / "Deped word horizontal logo.png",
 }
 
@@ -55,7 +60,7 @@ AUDIT_SCOPE_OPTIONS = [
     ("system", "System"),
 ]
 
-GRADE_LEVELS = ["K Stage 1", "K Stage 2", "K Stage 3", "K Stage 4"]
+GRADE_LEVELS = ["Kindergarten"] + [f"Grade {number}" for number in range(1, 13)]
 PROGRAMS = ["Alive", "IPED", "ADM", "ALS", "SNED", "DRRM", "HEALTH"]
 SUBJECTS = [
     "Filipino",
@@ -72,14 +77,42 @@ SUBJECTS = [
 ]
 CATEGORIES = [
     "Learning Mat",
-    "LAST",
     "Quarter Test Questionnaire",
     "Story Books",
     "Instructional Materials",
     "Manipulative",
     "Intervention Materials",
     "Research",
+    "Video Lesson",
+    "Strategic Intervention Material",
+    "Science Intervention Material",
+    "Learning Activity Sheet",
+    "1st Term Test Questions",
+    "2nd Term Test Questions",
+    "3rd Term Test Questions",
+    "Learning Area",
 ]
+INVENTORY_ITEM_SELECT_COLUMNS = ", ".join(
+    [
+        "inventory_items.id",
+        "inventory_items.title",
+        "inventory_items.author",
+        "inventory_items.grade_level",
+        "inventory_items.program",
+        "inventory_items.subject",
+        "inventory_items.date_validated",
+        "inventory_items.category",
+        "inventory_items.remarks",
+        "inventory_items.status",
+        "inventory_items.attachment_name",
+        "inventory_items.attachment_content_type",
+        "inventory_items.attachment_size",
+        "inventory_items.created_by",
+        "inventory_items.updated_by",
+        "inventory_items.created_at",
+        "inventory_items.updated_at",
+    ]
+)
 
 
 def utc_now():
@@ -152,7 +185,7 @@ def write_manager_setup_note(username, password):
     ensure_directories()
     content = "\n".join(
         [
-            "Inventory initial manager access",
+            f"{APP_TITLE} initial manager access",
             "",
             f"Username: {username}",
             f"Temporary password: {password}",
@@ -181,6 +214,58 @@ def format_file_size(num_bytes):
         if size < 1024 or unit == units[-1]:
             return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
         size /= 1024
+
+
+def sanitize_attachment_name(filename):
+    cleaned = (filename or "").replace("\\", "/").split("/")[-1].strip()
+    cleaned = re.sub(r"[\r\n\t]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned[:180] or None
+
+
+def validate_attachment_upload(form_files):
+    upload = form_files.get("attachment")
+    if not upload:
+        return None, []
+
+    filename = sanitize_attachment_name(upload.get("filename", ""))
+    content = upload.get("content", b"")
+    if not filename and not content:
+        return None, []
+
+    errors = []
+    if not filename:
+        errors.append("Attachment file name is invalid.")
+        return None, errors
+    if not content:
+        errors.append("Attachment file is empty.")
+    if len(content) > MAX_ATTACHMENT_SIZE:
+        errors.append(f"Attachment must be {format_file_size(MAX_ATTACHMENT_SIZE)} or smaller.")
+
+    content_type = (upload.get("content_type") or "").split(";", 1)[0].strip() or "application/octet-stream"
+    return {
+        "name": filename,
+        "content": content,
+        "content_type": content_type,
+        "size": len(content),
+    }, errors
+
+
+def build_attachment_info(item):
+    if not item or not item["attachment_name"]:
+        return None
+
+    size_label = format_file_size(item["attachment_size"]) if item["attachment_size"] is not None else ""
+    return {
+        "name": item["attachment_name"],
+        "href": f'/inventory/{item["id"]}/attachment',
+        "size_label": size_label,
+    }
+
+
+def build_content_disposition(filename):
+    fallback = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._") or "attachment"
+    return f'inline; filename="{fallback}"; filename*=UTF-8\'\'{quote(filename)}'
 
 
 def get_connection():
@@ -309,6 +394,10 @@ def init_db():
                 category TEXT NOT NULL,
                 remarks TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'Pending Review',
+                attachment_name TEXT,
+                attachment_content_type TEXT,
+                attachment_size INTEGER,
+                attachment_blob BLOB,
                 created_by INTEGER NOT NULL,
                 updated_by INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
@@ -348,9 +437,24 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
             """
         )
+        ensure_inventory_attachment_columns(connection)
         ensure_default_manager(connection)
+        ensure_lrmds_branding(connection)
         ensure_manager_setup_note(connection)
         clear_expired_sessions(connection)
+
+
+def ensure_inventory_attachment_columns(connection):
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(inventory_items)").fetchall()}
+    desired_columns = {
+        "attachment_name": "TEXT",
+        "attachment_content_type": "TEXT",
+        "attachment_size": "INTEGER",
+        "attachment_blob": "BLOB",
+    }
+    for column_name, column_type in desired_columns.items():
+        if column_name not in columns:
+            connection.execute(f"ALTER TABLE inventory_items ADD COLUMN {column_name} {column_type}")
 
 
 def ensure_default_manager(connection):
@@ -369,7 +473,7 @@ def ensure_default_manager(connection):
         VALUES (?, ?, ?, ?, 1, 1, 0, NULL, ?, ?)
         """,
         (
-            "ILRC Manager",
+            MANAGER_DISPLAY_NAME,
             DEFAULT_MANAGER_USERNAME,
             hash_password(initial_password),
             ROLE_MANAGER,
@@ -385,6 +489,17 @@ def ensure_default_manager(connection):
         f'Created the initial manager account and wrote a setup note at "{relative_display_path(setup_note)}".',
         None,
         "127.0.0.1",
+    )
+
+
+def ensure_lrmds_branding(connection):
+    connection.execute(
+        """
+        UPDATE users
+        SET full_name = ?, updated_at = ?
+        WHERE role = ? AND full_name = ?
+        """,
+        (MANAGER_DISPLAY_NAME, utc_now(), ROLE_MANAGER, "ILRC Manager"),
     )
 
 
@@ -502,6 +617,8 @@ def nav_items(user):
 
 def render_options(options, selected):
     markup = []
+    if selected and selected not in options:
+        markup.append(f'<option value="{escape(selected)}" selected>{escape(selected)}</option>')
     for option in options:
         is_selected = " selected" if option == selected else ""
         markup.append(f'<option value="{escape(option)}"{is_selected}>{escape(option)}</option>')
@@ -525,8 +642,8 @@ def render_flash(kind, message):
 def page_intro(active_key, title):
     mapping = {
         "dashboard": (
-            "Welcome to DepEd Cabadbaran City Division",
-            "Monitor submissions, approvals, and shared resource activity from one division-centered workspace.",
+            f"Welcome to the {PORTAL_NAME}",
+            "Monitor submissions, approvals, and shared resource activity from one shared LRMDS workspace.",
         ),
         "inventory": (
             "Learning Resource Records",
@@ -534,7 +651,7 @@ def page_intro(active_key, title):
         ),
         "new-item": (
             "Resource Submission",
-            "Add a new learning resource entry for review, approval, and shared division access.",
+            "Add a new learning resource entry for review, approval, and shared portal access.",
         ),
         "users": (
             "Portal User Management",
@@ -553,7 +670,7 @@ def page_intro(active_key, title):
             "Maintain your password and keep access to the shared learning resource portal secure.",
         ),
     }
-    return mapping.get(active_key, ("DepEd Cabadbaran City Division", f"Manage {title.lower()} in the shared inventory workspace."))
+    return mapping.get(active_key, (PORTAL_NAME, f"Manage {title.lower()} in the shared LRMDS inventory workspace."))
 
 
 def render_layout(title, user, content, active_key, csrf_token="", flash=""):
@@ -577,11 +694,11 @@ def render_layout(title, user, content, active_key, csrf_token="", flash=""):
     <aside class="sidebar app-sidebar">
       <div class="sidebar-shell">
         <a class="sidebar-brand" href="/dashboard">
-          <img class="sidebar-logo" src="/media/division-logo?v=2" alt="DepEd Cabadbaran City Division logo">
+          <img class="sidebar-logo" src="/media/division-logo?v=2" alt="LRMDS portal logo">
           <div class="sidebar-brand-copy">
-            <p class="eyebrow">ILRC Shared Inventory</p>
-            <h1>Inventory</h1>
-            <p class="sidebar-brand-meta">DepEd Cabadbaran City Division</p>
+            <p class="eyebrow">LRMDS Inventory</p>
+            <h1>{escape(APP_TITLE)}</h1>
+            <p class="sidebar-brand-meta">{escape(PORTAL_NAME)}</p>
             <p class="sidebar-brand-note">Shared workspace for teacher submissions, review, and inventory tracking.</p>
           </div>
         </a>
@@ -618,7 +735,7 @@ def render_layout(title, user, content, active_key, csrf_token="", flash=""):
           <div class="page-inline-meta">
             <span class="page-summary-label">Inventory Focus</span>
             <strong>{escape(title)}</strong>
-            <span class="muted small">DepEd Cabadbaran City Division resource management</span>
+            <span class="muted small">Learning resource management across the shared portal</span>
           </div>
         </div>
       </header>
@@ -627,7 +744,7 @@ def render_layout(title, user, content, active_key, csrf_token="", flash=""):
         {content}
       </section>
       <footer class="portal-footer portal-footer-inline">
-        <p>Department of Education, Cabadbaran City Division. Km. 1, Hinagdanan, Comagascas, Cabadbaran City, Agusan del Norte. LRMS Portal: <a href="https://portal.depedcabadbarancity.org/lrms">portal.depedcabadbarancity.org/lrms</a></p>
+        <p>{escape(PORTAL_NAME)} portal for shared submission, review, and inventory tracking.</p>
       </footer>
     </main>
   </div>
@@ -667,18 +784,18 @@ def render_login_page(error_message="", username=""):
       <div class="login-copy-top">
         <img class="login-wordmark" src="/media/deped-wordmark" alt="DepEd wordmark">
         <div class="login-brand-cluster">
-          <img class="login-seal" src="/media/division-logo?v=2" alt="DepEd Cabadbaran City Division logo">
+          <img class="login-seal" src="/media/division-logo?v=2" alt="LRMDS portal logo">
           <div class="login-brand-text">
             <p class="eyebrow">Department of Education</p>
-            <h1>Cabadbaran City Division</h1>
-            <p class="login-subtitle">Inventory</p>
+            <h1>{escape(PORTAL_NAME)}</h1>
+            <p class="login-subtitle">Inventory Portal</p>
           </div>
         </div>
       </div>
       <div class="login-copy-body">
-        <p class="eyebrow">Welcome to DepEd Cabadbaran City Division</p>
+        <p class="eyebrow">Welcome to the {escape(PORTAL_NAME)}</p>
         <h2 class="login-hero-title">Shared access for submission, review, and inventory tracking.</h2>
-        <p class="lead">A lighter, division-centered workspace for teachers and the ILRC manager to manage learning resources without separate desktop files.</p>
+        <p class="lead">A lighter shared workspace for teachers and the LRMDS manager to manage learning resources without separate desktop files.</p>
         <div class="login-badge-list">
           <span class="login-badge">Teacher submissions</span>
           <span class="login-badge">Manager approvals</span>
@@ -691,12 +808,12 @@ def render_login_page(error_message="", username=""):
           <p>Submit new learning resources and monitor the status of your entries in one place.</p>
         </div>
         <div class="login-meta-item">
-          <span class="login-meta-label">For the ILRC Manager</span>
-          <p>Review, approve, and maintain a shared division inventory with audit visibility.</p>
+          <span class="login-meta-label">For the LRMDS Manager</span>
+          <p>Review, approve, and maintain a shared LRMDS inventory with audit visibility.</p>
         </div>
         <div class="login-meta-item">
-          <span class="login-meta-label">For the Division</span>
-          <p>Keep records centralized, current, and easier to access across Cabadbaran City Division.</p>
+          <span class="login-meta-label">For Shared Access</span>
+          <p>Keep records centralized, current, and easier to access across the portal.</p>
         </div>
       </div>
     </section>
@@ -753,33 +870,46 @@ def render_dashboard(connection, user, csrf_token):
     ).fetchone()["total"]
     recent_items = connection.execute(
         """
-        SELECT inventory_items.*, users.full_name AS owner_name
+        SELECT """
+        + INVENTORY_ITEM_SELECT_COLUMNS
+        + """, users.full_name AS owner_name
         FROM inventory_items
         JOIN users ON users.id = inventory_items.created_by
         ORDER BY inventory_items.updated_at DESC
         LIMIT 6
         """
     ).fetchall()
-    category_rows = connection.execute(
+    grade_rows = connection.execute(
         """
-        SELECT category, COUNT(*) AS total
+        SELECT grade_level, COUNT(*) AS total
         FROM inventory_items
-        GROUP BY category
-        ORDER BY total DESC, category ASC
-        LIMIT 6
+        GROUP BY grade_level
         """
     ).fetchall()
 
-    if total_items:
+    grade_totals = {row["grade_level"]: row["total"] for row in grade_rows}
+    chart_rows = [{"grade_level": grade, "total": grade_totals.get(grade, 0)} for grade in GRADE_LEVELS]
+    legacy_rows = sorted(
+        (
+            {"grade_level": grade_level, "total": total}
+            for grade_level, total in grade_totals.items()
+            if grade_level not in GRADE_LEVELS
+        ),
+        key=lambda row: row["grade_level"],
+    )
+    chart_rows.extend(legacy_rows)
+    chart_peak = max((row["total"] for row in chart_rows), default=0)
+
+    if total_items and chart_peak:
         distribution_markup = "".join(
             (
-                '<div class="metric-row">'
-                f'<div class="metric-label">{escape(row["category"])}</div>'
-                f'<div class="metric-bar"><span style="width:{max(10, int((row["total"] / total_items) * 100))}%"></span></div>'
+                '<div class="metric-row metric-row-grade">'
+                f'<div class="metric-label">{escape(row["grade_level"])}</div>'
+                f'<div class="metric-bar"><span style="width:{(max(8, (row["total"] / chart_peak) * 100) if row["total"] else 0):.2f}%"></span></div>'
                 f'<div class="metric-value">{escape(row["total"])}</div>'
                 "</div>"
             )
-            for row in category_rows
+            for row in chart_rows
         )
     else:
         distribution_markup = '<p class="empty-state">No inventory items yet. Start by adding a resource entry.</p>'
@@ -828,7 +958,7 @@ def render_dashboard(connection, user, csrf_token):
         '<div class="dashboard-copy">'
         '<p class="eyebrow">Workspace Overview</p>'
         f'<h3>{escape("Manager view" if user["role"] == ROLE_MANAGER else "Teacher workspace")}</h3>'
-        '<p class="lead">The portal keeps your learning-resource records centralized, reviewable, and easier to manage across the division.</p>'
+        '<p class="lead">The portal keeps your learning-resource records centralized, reviewable, and easier to manage across the LRMDS workspace.</p>'
         '</div>'
         '<div class="hero-actions dashboard-actions">'
         '<a class="btn btn-primary" href="/inventory/new">Add New Resource</a>'
@@ -844,7 +974,7 @@ def render_dashboard(connection, user, csrf_token):
         f"<tbody>{recent_markup}</tbody></table></div>"
         '</article>'
         '<article class="dashboard-section dashboard-insight">'
-        '<div class="card-header"><h3>Category Mix</h3><p class="muted small">Helps the ILRC manager spot gaps and concentration</p></div>'
+        '<div class="card-header"><h3>Grade Level Distribution</h3><p class="muted small">Shows where submitted resources are concentrated across kindergarten to Grade 12.</p></div>'
         f'<div class="metrics-list">{distribution_markup}</div>'
         '</article>'
         '</section>'
@@ -928,7 +1058,7 @@ def render_form_errors(errors):
     return f'<div class="flash flash-danger"><ul class="error-list">{items}</ul></div>'
 
 
-def render_item_form(user, csrf_token, values, errors, mode, item_id=None):
+def render_item_form(user, csrf_token, values, errors, mode, item_id=None, existing_attachment=None):
     heading = "Edit Resource Entry" if mode == "edit" else "Add Resource Entry"
     eyebrow = "Update Entry" if mode == "edit" else "New Submission"
     intro = (
@@ -963,6 +1093,24 @@ def render_item_form(user, csrf_token, values, errors, mode, item_id=None):
         </label>
         """
     )
+    attachment_markup = ""
+    if existing_attachment:
+        attachment_markup = (
+            '<div class="attachment-current">'
+            '<span class="attachment-label">Current File</span>'
+            f'<a class="table-action" href="{existing_attachment["href"]}">{escape(existing_attachment["name"])}</a>'
+            f'<p class="muted small attachment-meta">{escape(existing_attachment["size_label"] or "Attached to this entry")}</p>'
+            '<div class="attachment-remove">'
+            '<input id="remove-attachment" type="checkbox" name="remove_attachment" value="1">'
+            '<label for="remove-attachment">Remove current file</label>'
+            "</div>"
+            "</div>"
+        )
+    attachment_reset_note = (
+        '<p class="muted small attachment-meta">If validation fails after you choose a file, select it again before resubmitting.</p>'
+        if errors
+        else ""
+    )
 
     return (
         '<section class="entry-page">'
@@ -973,7 +1121,7 @@ def render_item_form(user, csrf_token, values, errors, mode, item_id=None):
         f'<p class="muted small entry-note">{escape(helper_note)}</p>'
         "</div>"
         f"{render_form_errors(errors)}"
-        f'<form method="post" action="{action}" class="form-grid inventory-form entry-form-grid">'
+        f'<form method="post" action="{action}" enctype="multipart/form-data" class="form-grid inventory-form entry-form-grid">'
         f'<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">'
         '<label class="span-2">'
         "<span>Title</span>"
@@ -1004,6 +1152,13 @@ def render_item_form(user, csrf_token, values, errors, mode, item_id=None):
         f'<select name="category">{render_options(CATEGORIES, values["category"])}</select>'
         "</label>"
         f"{status_input}"
+        '<div class="span-2 attachment-field">'
+        '<span class="field-label">Attach File</span>'
+        '<input id="attachment-upload" type="file" name="attachment">'
+        '<p class="muted small attachment-meta">Optional. Upload the supporting file the validator needs to review. Maximum size: 15 MB.</p>'
+        f"{attachment_markup}"
+        f"{attachment_reset_note}"
+        "</div>"
         '<label class="span-2">'
         "<span>Remarks</span>"
         f'<textarea name="remarks" rows="4" maxlength="300" placeholder="Notes, special use, review remarks, or location details.">{escape(values["remarks"])}</textarea>'
@@ -1018,6 +1173,7 @@ def render_item_form(user, csrf_token, values, errors, mode, item_id=None):
 
 
 def render_item_detail_page(connection, user, csrf_token, item):
+    attachment = build_attachment_info(item)
     field_rows = [
         ("Title", item["title"]),
         ("Author/Writer", item["author"]),
@@ -1064,6 +1220,24 @@ def render_item_detail_page(connection, user, csrf_token, item):
     if not audit_markup:
         audit_markup = '<p class="empty-state">No activity history yet for this item.</p>'
 
+    attachment_markup = (
+        '<div class="remarks-card attachment-card">'
+        '<span class="detail-label">Attached File</span>'
+        '<div class="attachment-actions">'
+        f'<a class="btn btn-secondary" href="{attachment["href"]}">Open File</a>'
+        "</div>"
+        f'<p class="detail-remarks attachment-copy">{escape(attachment["name"])}</p>'
+        f'<p class="muted small attachment-meta">{escape(attachment["size_label"] or "Supporting file attached to this entry.")}</p>'
+        "</div>"
+        if attachment
+        else (
+            '<div class="remarks-card attachment-card">'
+            '<span class="detail-label">Attached File</span>'
+            '<p class="detail-remarks attachment-copy">No supporting file was attached to this entry.</p>'
+            "</div>"
+        )
+    )
+
     edit_link = (
         f'<a class="btn btn-primary" href="/inventory/{item["id"]}/edit">Edit Entry</a>'
         if can_edit_item(user, item)
@@ -1105,6 +1279,7 @@ def render_item_detail_page(connection, user, csrf_token, item):
         '<div class="detail-grid">'
         f"{details_markup}"
         "</div>"
+        f"{attachment_markup}"
         '<div class="remarks-card">'
         '<span class="detail-label">Remarks</span>'
         f'<p class="detail-remarks">{remarks_markup}</p>'
@@ -1277,7 +1452,7 @@ def render_inventory_page(connection, user, csrf_token, filters):
     offset = (current_page - 1) * PAGE_SIZE
     rows = connection.execute(
         f"""
-        SELECT inventory_items.*, users.full_name AS owner_name
+        SELECT {INVENTORY_ITEM_SELECT_COLUMNS}, users.full_name AS owner_name
         FROM inventory_items
         JOIN users ON users.id = inventory_items.created_by
         {where_sql}
@@ -1293,6 +1468,8 @@ def render_inventory_page(connection, user, csrf_token, filters):
         can_delete = user["role"] == ROLE_MANAGER
         actions = ['<div class="inventory-actions">']
         actions.append(f'<a class="table-action" href="/inventory/{row["id"]}">View</a>')
+        if row["attachment_name"]:
+            actions.append(f'<a class="table-action" href="/inventory/{row["id"]}/attachment">View File</a>')
         if can_edit:
             actions.append(f'<a class="table-action" href="/inventory/{row["id"]}/edit">Edit</a>')
         if can_delete:
@@ -1706,9 +1883,40 @@ def render_password_page(csrf_token, errors, force_change):
 
 def parse_form_body(handler):
     length = int(handler.headers.get("Content-Length", "0") or "0")
-    raw = handler.rfile.read(length).decode("utf-8") if length else ""
-    parsed = parse_qs(raw, keep_blank_values=True)
-    return {key: values[0] for key, values in parsed.items()}
+    raw = handler.rfile.read(length) if length else b""
+    content_type = handler.headers.get("Content-Type", "")
+
+    if content_type.startswith("multipart/form-data"):
+        message = BytesParser(policy=default_email_policy).parsebytes(
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + raw
+        )
+        if not message.is_multipart():
+            return {}, {}
+        form_values = {}
+        form_files = {}
+        for part in message.iter_parts():
+            if part.get_content_disposition() != "form-data":
+                continue
+            field_name = part.get_param("name", header="content-disposition")
+            if not field_name:
+                continue
+
+            payload = part.get_payload(decode=True) or b""
+            filename = part.get_filename()
+            if filename is not None:
+                form_files[field_name] = {
+                    "filename": filename,
+                    "content_type": part.get_content_type(),
+                    "content": payload,
+                }
+                continue
+
+            charset = part.get_content_charset() or "utf-8"
+            form_values[field_name] = payload.decode(charset, errors="replace")
+        return form_values, form_files
+
+    parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True) if raw else {}
+    return {key: values[0] for key, values in parsed.items()}, {}
 
 
 def ensure_csrf(form_values, session):
@@ -1840,13 +2048,19 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
             body = render_item_form(user, csrf_token, base_item_values(), [], "new")
             return self.send_html(200, render_layout("Add Entry", user, body, "new-item", csrf_token, flash))
 
+        attachment_match = re.fullmatch(r"/inventory/(\d+)/attachment", path)
+        if attachment_match:
+            return self.handle_item_attachment(int(attachment_match.group(1)), user)
+
         item_match = re.fullmatch(r"/inventory/(\d+)", path)
         if item_match:
             item_id = int(item_match.group(1))
             with get_connection() as connection:
                 item = connection.execute(
                     """
-                    SELECT inventory_items.*, users.full_name AS owner_name
+                    SELECT """
+                    + INVENTORY_ITEM_SELECT_COLUMNS
+                    + """, users.full_name AS owner_name
                     FROM inventory_items
                     JOIN users ON users.id = inventory_items.created_by
                     WHERE inventory_items.id = ?
@@ -1878,7 +2092,15 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                 "remarks": item["remarks"],
                 "status": item["status"],
             }
-            body = render_item_form(user, csrf_token, values, [], "edit", item_id=item_id)
+            body = render_item_form(
+                user,
+                csrf_token,
+                values,
+                [],
+                "edit",
+                item_id=item_id,
+                existing_attachment=build_attachment_info(item),
+            )
             return self.send_html(200, render_layout("Edit Entry", user, body, "inventory", csrf_token, flash))
 
         if path == "/users":
@@ -1933,7 +2155,9 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
             with get_connection() as connection:
                 rows = connection.execute(
                     """
-                    SELECT inventory_items.*, users.full_name AS owner_name
+                    SELECT """
+                    + INVENTORY_ITEM_SELECT_COLUMNS
+                    + """, users.full_name AS owner_name
                     FROM inventory_items
                     JOIN users ON users.id = inventory_items.created_by
                     ORDER BY inventory_items.updated_at DESC, inventory_items.id DESC
@@ -1956,7 +2180,7 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         session_id, session, user = self.get_auth_context()
-        form_values = parse_form_body(self)
+        form_values, form_files = parse_form_body(self)
 
         if path == "/login":
             return self.handle_login(form_values)
@@ -1977,7 +2201,7 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
             return self.redirect("/account/password")
 
         if path == "/inventory/new":
-            return self.handle_create_item(user, session, session_id, form_values)
+            return self.handle_create_item(user, session, session_id, form_values, form_files)
 
         if path == "/backup":
             return self.handle_backup(user, session, session_id)
@@ -1991,7 +2215,7 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
 
         edit_match = re.fullmatch(r"/inventory/(\d+)/edit", path)
         if edit_match:
-            return self.handle_edit_item(int(edit_match.group(1)), user, session, session_id, form_values)
+            return self.handle_edit_item(int(edit_match.group(1)), user, session, session_id, form_values, form_files)
 
         delete_match = re.fullmatch(r"/inventory/(\d+)/delete", path)
         if delete_match:
@@ -2034,6 +2258,25 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
             session = None
         return session_id, session, user
 
+    def handle_item_attachment(self, item_id, user):
+        with get_connection() as connection:
+            item = connection.execute(
+                """
+                SELECT id, title, attachment_name, attachment_content_type, attachment_blob
+                FROM inventory_items
+                WHERE id = ?
+                """,
+                (item_id,),
+            ).fetchone()
+        if not item:
+            return self.send_text(404, "Attachment item not found.")
+        if not item["attachment_name"] or item["attachment_blob"] is None:
+            return self.send_text(404, "No attachment found for this item.")
+
+        content_type = item["attachment_content_type"] or mimetypes.guess_type(item["attachment_name"])[0] or "application/octet-stream"
+        headers = {"Content-Disposition": build_content_disposition(item["attachment_name"])}
+        return self.send_response_with_body(200, item["attachment_blob"], content_type, headers)
+
     def handle_login(self, form_values):
         username = clean_username(form_values.get("username", "") or "")
         password = form_values.get("password", "")
@@ -2045,7 +2288,7 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
             if not user:
                 return self.send_html(200, render_login_page("Invalid username or password.", form_values.get("username", "")))
             if not user["is_active"]:
-                return self.send_html(200, render_login_page("This account has been disabled. Contact the ILRC manager.", form_values.get("username", "")))
+                return self.send_html(200, render_login_page("This account has been disabled. Contact the LRMDS manager.", form_values.get("username", "")))
             if user["locked_until"]:
                 locked_until = datetime.fromisoformat(user["locked_until"])
                 if locked_until > datetime.utcnow():
@@ -2088,8 +2331,10 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
         self.set_cookie(SESSION_COOKIE_NAME, session_id)
         return self.redirect("/dashboard")
 
-    def handle_create_item(self, user, session, session_id, form_values):
+    def handle_create_item(self, user, session, session_id, form_values, form_files):
         values, errors = validate_item_form(form_values, user)
+        attachment, attachment_errors = validate_attachment_upload(form_files)
+        errors.extend(attachment_errors)
         if errors:
             body = render_item_form(user, session["csrf_token"], values, errors, "new")
             return self.send_html(200, render_layout("Add Entry", user, body, "new-item", session["csrf_token"]))
@@ -2100,9 +2345,10 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                 """
                 INSERT INTO inventory_items (
                     title, author, grade_level, program, subject, date_validated,
-                    category, remarks, status, created_by, updated_by, created_at, updated_at
+                    category, remarks, status, attachment_name, attachment_content_type,
+                    attachment_size, attachment_blob, created_by, updated_by, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     values["title"],
@@ -2114,6 +2360,10 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                     values["category"],
                     values["remarks"],
                     values["status"] if user["role"] == ROLE_MANAGER else ITEM_STATUS_PENDING,
+                    attachment["name"] if attachment else None,
+                    attachment["content_type"] if attachment else None,
+                    attachment["size"] if attachment else None,
+                    attachment["content"] if attachment else None,
                     user["id"],
                     user["id"],
                     now,
@@ -2124,14 +2374,18 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                 connection,
                 user["id"],
                 "inventory.create",
-                f'Created inventory item "{values["title"]}".',
+                (
+                    f'Created inventory item "{values["title"]}" with attachment "{attachment["name"]}".'
+                    if attachment
+                    else f'Created inventory item "{values["title"]}".'
+                ),
                 cursor.lastrowid,
                 self.client_address[0],
             )
         self.set_flash(session_id, "success", "Inventory entry saved to the shared portal.")
         return self.redirect("/inventory")
 
-    def handle_edit_item(self, item_id, user, session, session_id, form_values):
+    def handle_edit_item(self, item_id, user, session, session_id, form_values, form_files):
         with get_connection() as connection:
             item = connection.execute("SELECT * FROM inventory_items WHERE id = ?", (item_id,)).fetchone()
             if not item:
@@ -2141,17 +2395,46 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                 return self.send_html(403, render_layout("Forbidden", user, self.render_forbidden("You cannot edit that item."), "inventory", session["csrf_token"]))
 
             values, errors = validate_item_form(form_values, user, is_edit=True)
+            attachment, attachment_errors = validate_attachment_upload(form_files)
+            errors.extend(attachment_errors)
             if errors:
                 values["status"] = item["status"] if user["role"] != ROLE_MANAGER else values["status"]
-                body = render_item_form(user, session["csrf_token"], values, errors, "edit", item_id=item_id)
+                body = render_item_form(
+                    user,
+                    session["csrf_token"],
+                    values,
+                    errors,
+                    "edit",
+                    item_id=item_id,
+                    existing_attachment=build_attachment_info(item),
+                )
                 return self.send_html(200, render_layout("Edit Entry", user, body, "inventory", session["csrf_token"]))
 
             status_value = values["status"] if user["role"] == ROLE_MANAGER else ITEM_STATUS_PENDING
+            remove_attachment = form_values.get("remove_attachment") == "1"
+            attachment_name = item["attachment_name"]
+            attachment_content_type = item["attachment_content_type"]
+            attachment_size = item["attachment_size"]
+            attachment_blob = item["attachment_blob"]
+            attachment_note = ""
+            if attachment:
+                attachment_name = attachment["name"]
+                attachment_content_type = attachment["content_type"]
+                attachment_size = attachment["size"]
+                attachment_blob = attachment["content"]
+                attachment_note = f' Replaced attachment with "{attachment["name"]}".'
+            elif remove_attachment and item["attachment_name"]:
+                attachment_name = None
+                attachment_content_type = None
+                attachment_size = None
+                attachment_blob = None
+                attachment_note = " Removed the attachment."
             connection.execute(
                 """
                 UPDATE inventory_items
                 SET title = ?, author = ?, grade_level = ?, program = ?, subject = ?,
                     date_validated = ?, category = ?, remarks = ?, status = ?,
+                    attachment_name = ?, attachment_content_type = ?, attachment_size = ?, attachment_blob = ?,
                     updated_by = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -2165,6 +2448,10 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                     values["category"],
                     values["remarks"],
                     status_value,
+                    attachment_name,
+                    attachment_content_type,
+                    attachment_size,
+                    attachment_blob,
                     user["id"],
                     utc_now(),
                     item_id,
@@ -2178,7 +2465,8 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                     f'Updated inventory item "{values["title"]}".'
                     if user["role"] == ROLE_MANAGER
                     else f'Updated inventory item "{values["title"]}" and returned it for manager review.'
-                ),
+                )
+                + attachment_note,
                 item_id,
                 self.client_address[0],
             )
@@ -2517,6 +2805,7 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                 "Subject",
                 "Date Validated",
                 "Category",
+                "Attachment",
                 "Remarks",
                 "Status",
                 "Submitted By",
@@ -2534,6 +2823,7 @@ class InventoryPortalHandler(BaseHTTPRequestHandler):
                     row["subject"],
                     row["date_validated"],
                     row["category"],
+                    row["attachment_name"] or "",
                     row["remarks"],
                     row["status"],
                     row["owner_name"],

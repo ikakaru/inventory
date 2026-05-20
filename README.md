@@ -1,6 +1,6 @@
-# Inventory
+# LRMDS Inventory
 
-This workspace includes a shared web portal that modernizes the original desktop-only inventory tool without deleting the legacy source.
+This workspace includes a shared LRMDS web portal that modernizes the original desktop-only inventory tool without deleting the legacy source.
 
 The shared portal uses pure Python on the backend plus HTML and CSS on the frontend, so it runs without Flask or other external web packages.
 
@@ -17,7 +17,7 @@ The shared portal uses pure Python on the backend plus HTML and CSS on the front
   - Category
   - Remarks
 - Teachers can sign in and submit records.
-- The ILRC manager can review, approve, revise, export, back up, restore, and manage user access.
+- The LRMDS manager can review, approve, revise, export, back up, restore, and manage user access.
 - Teacher edits automatically return entries to `Pending Review` so reviewed content is re-checked after changes.
 - Managers can open a full item details page to review remarks and history before changing status.
 - Managers can reset a teacher password and force a password change on the next login.
