@@ -16,6 +16,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 
 APP_TITLE = "LRMDS Inventory"
@@ -113,6 +114,12 @@ INVENTORY_ITEM_SELECT_COLUMNS = ", ".join(
         "inventory_items.updated_at",
     ]
 )
+UTC_TIMEZONE = ZoneInfo("UTC")
+DISPLAY_TIMEZONE_NAME = os.environ.get("INVENTORY_PORTAL_TIMEZONE", "Asia/Manila").strip() or "Asia/Manila"
+try:
+    DISPLAY_TIMEZONE = ZoneInfo(DISPLAY_TIMEZONE_NAME)
+except Exception:
+    DISPLAY_TIMEZONE = datetime.now().astimezone().tzinfo or UTC_TIMEZONE
 
 
 def utc_now():
@@ -123,19 +130,48 @@ def utc_after(seconds):
     return (datetime.utcnow() + timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
 
 
+def to_display_datetime(value):
+    if not value:
+        return None
+
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC_TIMEZONE)
+    return parsed.astimezone(DISPLAY_TIMEZONE)
+
+
 def human_time(value):
+    display_value = to_display_datetime(value)
+    if display_value:
+        return display_value.strftime("%Y-%m-%d %H:%M:%S")
     if not value:
         return "-"
     return value.replace("T", " ")
 
 
 def human_date(value):
+    display_value = to_display_datetime(value)
+    if display_value:
+        return display_value.strftime("%Y-%m-%d")
     if not value:
         return "-"
     return value.split("T", 1)[0]
 
 
 def human_clock(value):
+    display_value = to_display_datetime(value)
+    if display_value:
+        return display_value.strftime("%H:%M:%S")
     if not value:
         return "-"
     return value.split("T", 1)[1] if "T" in value else value
