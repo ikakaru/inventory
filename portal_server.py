@@ -762,11 +762,6 @@ def render_layout(title, user, content, active_key, csrf_token="", flash=""):
 
 def render_login_page(error_message="", username=""):
     error_markup = render_flash("danger", error_message)
-    setup_hint = (
-        f'<div class="login-hint"><p class="muted small">First-time setup on the host computer? Open <strong>{escape(relative_display_path(MANAGER_SETUP_PATH))}</strong> to find the one-time manager sign-in details.</p></div>'
-        if MANAGER_SETUP_PATH.exists()
-        else ""
-    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -833,7 +828,6 @@ def render_login_page(error_message="", username=""):
         </label>
         <button class="btn btn-primary" type="submit">Sign In to Inventory</button>
       </form>
-      {setup_hint}
     </section>
   </main>
 </body>
